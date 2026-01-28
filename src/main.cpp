@@ -1,26 +1,48 @@
 #include <Arduino.h>
-#include "GSM.h"
+#include "GPS.h"
 
-#define MODEM_RX 16
-#define MODEM_TX 17
+// GPS dùng UART2
+GPS gps(Serial2);
 
-GSM gsm(Serial2, 115200);
+unsigned long t_print = 0;
 
-void setup()
-{
-    Serial.begin(9600);
-    delay(3000);
+void setup() {
+    Serial.begin(9600);          // PC
+    delay(1000);
 
-    gsm.begin(MODEM_RX, MODEM_TX);
+    Serial.println("=== GPS LOCATION TEST ===");
 
-    Serial.println("Sending SMS...");
-    gsm.sendSMS("+84327161236", "HELLO CHIEN TRAN");
+    gps.begin(115200);           // GPS baud
 }
 
-void loop()
-{
-    while (Serial2.available())
-    {
-        Serial.write(Serial2.read());
+void loop() {
+    GPS::Data data = gps.read();
+
+    if (data.valid) {
+        Serial.print("GPS OK: ");
+        Serial.print(data.lat_deg);
+        Serial.print("°");
+        Serial.print(data.lat_min);
+        Serial.print("'");
+        Serial.print(data.lat_sec, 1);
+        Serial.print("\"");
+        Serial.print(data.lat_dir);
+        Serial.print("  ");
+
+        Serial.print(data.lon_deg);
+        Serial.print("°");
+        Serial.print(data.lon_min);
+        Serial.print("'");
+        Serial.print(data.lon_sec, 1);
+        Serial.print("\"");
+        Serial.println(data.lon_dir);
+
+        delay(1000);
+    }
+    else {
+        if (millis() - t_print > 2000) {
+            Serial.println("Dang TIM kiem GPS...");
+            t_print = millis();
+        }
     }
 }
