@@ -1,0 +1,419 @@
+#include "BMP180.h"
+#include <Adafruit_BMP085.h>
+
+// Đối tượng thư viện Adafruit (BMP180 dùng chung BMP085)
+static Adafruit_BMP085 bmp;
+
+// --- Khởi tạo ---
+BMP180::BMP180(uint8_t address) {
+    _address = address;
+    result = {0.0f, 0.0f, 0.0f, false};
+}
+
+// --- Khởi tạo cảm biến ---
+bool BMP180::begin() {
+    // I2C (Wire.begin) phải được gọi ở main
+    if (!bmp.begin()) {
+        return false;
+    }
+    return true;
+}
+
+// --- Đọc dữ liệu thô từ cảm biến ---
+bool BMP180::_readRawData() {
+    // Đọc áp suất (Pa → hPa)
+    result.pressure = bmp.readPressure() / 100.0f;
+
+    // Đọc nhiệt độ (°C)
+    result.temperature = bmp.readTemperature();
+
+    // Đọc độ cao (m) – mặc định theo mực nước biển
+    result.altitude = bmp.readAltitude();
+
+    return true;
+}
+
+// --- Hàm read(): đọc và trả về kết quả ---
+BMP180::Data BMP180::read() {
+    if (_readRawData()) {
+        result.valid = true;
+    } else {
+        result.valid = false;
+    }
+    return result;
+}
+
+
+#include "DHT11.h"
+
+// --- Khởi tạo ---
+DHT11::DHT11(int pin) {
+    _pin = pin;
+    pinMode(_pin, INPUT_PULLUP);
+    result = {0, 0, false};
+}
+
+// --- Đọc dữ liệu thô từ cảm biến ---
+bool DHT11::_readRawData(uint8_t data[5]) {
+    uint8_t cnt = 7, idx = 0;
+    for (int i = 0; i < 5; i++) data[i] = 0;
+
+    // Gửi tín hiệu bắt đầu tới cảm biến
+    pinMode(_pin, OUTPUT);
+    digitalWrite(_pin, LOW);
+    delay(20); // giữ mức thấp ít nhất 18ms
+    digitalWrite(_pin, HIGH);
+    delayMicroseconds(30);
+    pinMode(_pin, INPUT);
+
+    // Chờ cảm biến phản hồi
+    unsigned long start = micros();
+    while (digitalRead(_pin) == HIGH) {
+        if (micros() - start > 90) return false; // không phản hồi
+    }
+
+    // DHT kéo LOW ~80us
+    start = micros();
+    while (digitalRead(_pin) == LOW) {
+        if (micros() - start > 90) return false;
+    }
+
+    // DHT kéo HIGH ~80us
+    start = micros();
+    while (digitalRead(_pin) == HIGH) {
+        if (micros() - start > 90) return false;
+    }
+
+    // Đọc 40 bit dữ liệu
+    for (int i = 0; i < 40; i++) {
+        // Chờ tín hiệu LOW bắt đầu bit
+        start = micros();
+        while (digitalRead(_pin) == LOW) {
+            if (micros() - start > 80) return false;
+        }
+
+        // Đo độ dài mức HIGH để phân biệt 0 hoặc 1
+        unsigned long t = micros();
+        while (digitalRead(_pin) == HIGH) {
+            if (micros() - t > 90) break;
+        }
+
+        if ((micros() - t) > 40)
+            data[idx] |= (1 << cnt);
+
+        if (cnt == 0) {
+            cnt = 7;
+            idx++;
+        } else cnt--;
+    }
+
+    // Kiểm tra checksum
+    uint8_t sum = data[0] + data[1] + data[2] + data[3];
+    return (sum == data[4]);
+}
+
+// --- Hàm read(): đọc và trả về kết quả ---
+DHT11::Data DHT11::read() {
+    uint8_t data[5];
+    if (_readRawData(data)) {
+        result.humidity = data[0];
+        result.temperature = data[2];
+        result.valid = true;
+    } else {
+        result.valid = false;
+    }
+    return result;
+}
+
+#include "GPS.h"
+#include <string.h>
+#include <stdio.h>
+
+GPS::GPS(HardwareSerial &uart) : _uart(uart) {
+    data.valid = false;
+}
+
+void GPS::begin(uint32_t baud) {
+    // ESP32 UART2: RX=18, TX=17
+    _uart.begin(baud, SERIAL_8N1, 18, 17);
+}
+
+void GPS::convertToDMS(float ddmm, int &deg, int &min, float &sec) {
+    deg = (int)(ddmm / 100);
+    float m = ddmm - deg * 100;
+    min = (int)m;
+    sec = (m - min) * 60.0f;
+}
+
+bool GPS::parseRMC(char *line) {
+    char status;
+    float lat, lon;
+    char ns, ew;
+
+    // Bắt cả GPRMC và GNRMC
+    if (sscanf(line,
+        "$%*2cRMC,%*[^,],%c,%f,%c,%f,%c",
+        &status, &lat, &ns, &lon, &ew) == 5)
+    {
+        if (status == 'A') {
+            convertToDMS(lat, data.lat_deg, data.lat_min, data.lat_sec);
+            convertToDMS(lon, data.lon_deg, data.lon_min, data.lon_sec);
+            data.lat_dir = ns;
+            data.lon_dir = ew;
+            data.valid = true;
+            return true;
+        }
+    }
+    data.valid = false;
+    return false;
+}
+
+GPS::Data GPS::read() {
+    static char buffer[128];
+    static uint8_t idx = 0;
+
+    while (_uart.available()) {
+        char c = _uart.read();
+
+        if (c == '\n') {
+            buffer[idx] = '\0';
+            idx = 0;
+
+            if (strstr(buffer, "RMC")) {
+                parseRMC(buffer);
+                return data;
+            }
+        }
+        else if (idx < sizeof(buffer) - 1) {
+            buffer[idx++] = c;
+        }
+    }
+    return data;
+}
+#include "GSM.h"
+
+// --- Constructor ---
+GSM::GSM(HardwareSerial &serial, uint32_t baudrate)
+    : modem(serial), baud(baudrate) {}
+
+// --- Khởi động modem ---
+void GSM::begin(int rxPin, int txPin)
+{
+    modem.begin(baud, SERIAL_8N1, rxPin, txPin);
+    delay(12000); // chờ modem ổn định
+}
+
+// --- Chờ ký tự phản hồi từ modem ---
+void GSM::waitForChar(char target, uint32_t timeout)
+{
+    uint32_t start = millis();
+    while (millis() - start < timeout)
+    {
+        if (modem.available())
+        {
+            char c = modem.read();
+            Serial.write(c); // log debug
+            if (c == target) return;
+        }
+    }
+}
+
+// --- Gửi SMS ---
+void GSM::sendSMS(const char *phone, const char *message)
+{
+    modem.println("AT+CMGF=1");
+    delay(1000);
+
+    modem.print("AT+CMGS=\"");
+    modem.print(phone);
+    modem.println("\"");
+
+    // chờ dấu >
+    waitForChar('>');
+
+    modem.print(message);
+    delay(200);
+    modem.write(26); // Ctrl+Z
+}
+
+#include "Rainfall.h"
+
+volatile unsigned long Rainfall::_demXung = 0;
+
+// ===== Ngắt Hall =====
+void IRAM_ATTR Rainfall::ngatDemXung() {
+    _demXung++;
+}
+
+// ===== Constructor =====
+Rainfall::Rainfall(int chanHall,
+                   float duongKinhPhieu_mm,
+                   float theTichGau_mm3,
+                   unsigned long thoiGianDo_ms) {
+    _chanHall = chanHall;
+    _duongKinhPhieu = duongKinhPhieu_mm;
+    _theTichGau = theTichGau_mm3;
+    _thoiGianDo = thoiGianDo_ms;
+    _thoiGianTruoc = 0;
+}
+
+// ===== Begin =====
+void Rainfall::begin() {
+    pinMode(_chanHall, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(_chanHall), ngatDemXung, FALLING);
+}
+
+// ===== Tính diện tích phễu =====
+float Rainfall::tinhDienTichPhieu() {
+    return 3.1415926 * (_duongKinhPhieu / 2.0) * (_duongKinhPhieu / 2.0);
+}
+
+// ===== Tính hệ số K =====
+float Rainfall::tinhHeSoK(float dienTich) {
+    return _theTichGau / dienTich;
+}
+
+// ===== Read =====
+Rainfall::Data Rainfall::read() {
+    Data kq;
+    kq.valid = false;
+
+    if (millis() - _thoiGianTruoc >= _thoiGianDo) {
+        noInterrupts();
+        unsigned long xung = _demXung;
+        _demXung = 0;
+        interrupts();
+
+        float S = tinhDienTichPhieu();
+        float K = tinhHeSoK(S);
+
+        kq.soXung = xung;
+        kq.dienTichPhieu = S;
+        kq.heSoK = K;
+        kq.luongMua = xung * K;
+        kq.cuongDoMua = kq.luongMua * (3600000.0 / _thoiGianDo);
+        kq.valid = true;
+
+        _thoiGianTruoc = millis();
+    }
+
+    return kq;
+}
+
+#include "WindSpeed.h"
+
+WindSpeed* WindSpeed::_instance = nullptr;
+
+// ===== Biến debounce =====
+static volatile uint32_t _lastTick = 0;   // thời điểm xung hợp lệ gần nhất (ms)
+
+// --- Constructor ---
+WindSpeed::WindSpeed(uint8_t chan_cam_bien, float duong_kinh_canh)
+    : _chan_cam_bien(chan_cam_bien),
+      _duong_kinh_canh(duong_kinh_canh),
+      _dem_xung(0)
+{
+    _instance = this;
+}
+
+// --- Hàm ngắt Hall ---
+void IRAM_ATTR WindSpeed::_ngatCamBien() {
+    if (!_instance) return;
+
+    uint32_t now = millis();
+
+    // Debounce 10 ms: 1 vòng quay = 1 xung
+    if (now - _lastTick > 10) {
+        _instance->_dem_xung++;
+        _lastTick = now;
+    }
+}
+
+// --- Khởi tạo ---
+void WindSpeed::begin() {
+    pinMode(_chan_cam_bien, INPUT_PULLUP);
+    attachInterrupt(
+        digitalPinToInterrupt(_chan_cam_bien),
+        _ngatCamBien,
+        FALLING
+    );
+}
+
+WindSpeed::Data WindSpeed::read(uint32_t chu_ky_do_ms) {
+    static uint32_t lastTime = 0;
+    Data kq;
+    kq.valid = false;
+
+    if (millis() - lastTime >= chu_ky_do_ms) {
+        noInterrupts();
+        uint32_t so_xung = _dem_xung;
+        _dem_xung = 0;
+        interrupts();
+
+        float thoi_gian_s = chu_ky_do_ms / 1000.0f;
+        float chu_vi = PI * _duong_kinh_canh;
+        float quang_duong = so_xung * chu_vi;
+
+        kq.toc_do_gio = quang_duong / thoi_gian_s;
+        kq.so_xung = so_xung;
+        kq.valid = true;
+
+        lastTime = millis();
+    }
+
+    return kq;
+}
+
+// SCL 12. SDA 13
+#include <Arduino.h>
+#include <Wire.h>
+#include "BMP180.h"
+
+#define SDA_PIN 13
+#define SCL_PIN 12
+
+BMP180 bmp;   // địa chỉ mặc định 0x77
+
+void setup() {
+    Serial.begin(9600);
+    delay(1000);
+
+    Serial.println("=== TEST BMP180 ===");
+
+    // Khởi tạo I2C với chân tự chọn
+    Wire.begin(SDA_PIN, SCL_PIN);
+
+    // Khởi tạo BMP180
+    if (!bmp.begin()) {
+        Serial.println("❌ BMP180 khong ket noi duoc!");
+        while (1);
+    }
+
+    Serial.println("✅ BMP180 OK!");
+}
+
+void loop() {
+    BMP180::Data data = bmp.read();
+
+    if (data.valid) {
+        Serial.print("Nhiet do   : ");
+        Serial.print(data.temperature);
+        Serial.println(" *C");
+
+        Serial.print("Ap suat    : ");
+        Serial.print(data.pressure);
+        Serial.println(" hPa");
+
+        Serial.print("Do cao     : ");
+        Serial.print(data.altitude);
+        Serial.println(" m");
+
+        Serial.println("----------------------");
+    } else {
+        Serial.println("❌ Doc BMP180 THAT BAI!");
+    }
+
+    delay(2000);
+}
+
+
